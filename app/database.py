@@ -182,6 +182,20 @@ CREATE TABLE IF NOT EXISTS toll_bills (
     billed_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- 改期确认幂等记录：每个非空改期幂等键至多一条。原行程作废与新行程确认
+-- 在同一 BEGIN IMMEDIATE 事务内完成，本记录在该事务末尾写入，保存首次
+-- 结果（新旧行程号、复算行程、作废与冲销状态）。同键同内容重试（即使此后
+-- 修订/占用/档案已变化、原行程已被本次改期作废）直接重放首次结果；同键
+-- 异内容冲突。原确认快照与批次幂等记录均不被本流程改写。
+CREATE TABLE IF NOT EXISTS trip_reschedules (
+    idempotency_key TEXT PRIMARY KEY,                      -- 改期幂等键（非空）
+    old_trip_id     INTEGER NOT NULL REFERENCES confirmed_trips(trip_id),
+    target_revision INTEGER NOT NULL,                      -- 改期所据目标修订号
+    content_hash    TEXT NOT NULL,                         -- 提交内容（不含幂等键）的规范化哈希
+    result          TEXT NOT NULL,                         -- 首次成功结果 JSON（新行程号/复算行程/冲销状态等）
+    confirmed_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- 冲销单：作废已开单行程时在原作废事务内生成，每个账单至多一张
 -- （bill_trip_id 唯一兜底并发）。等额冲销——逐段金额与总额取账单原值的
 -- 相反数（账单为正、冲销为负，绝对值完全相等），费率版本引用沿用账单

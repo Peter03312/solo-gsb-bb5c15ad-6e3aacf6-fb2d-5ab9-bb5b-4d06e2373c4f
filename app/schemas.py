@@ -1,5 +1,5 @@
 """Pydantic 请求 / 响应模型。"""
-from typing import Optional
+from typing import Annotated, Optional
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -655,6 +655,53 @@ class BillOut(BaseModel):
 class BillResponse(BillOut):
     replayed: bool = Field(
         description="true=重复开单重试，返回的是首次账单（HTTP 200）；首次开单为 false（HTTP 201）",
+    )
+
+
+# ---- 不安全航次改期确认（原行程作废 + 新行程确认，幂等） ----------------------------
+
+class RescheduleConfirmRequest(BaseModel):
+    target_revision: int = Field(
+        description="改期所据目标潮位修订号（必填；事务内核验其仍为最新）"
+    )
+    departure_minutes: list[Annotated[int, Field(ge=0)]] = Field(
+        description="复核建议 reschedule.itinerary 中逐段出发分钟（绝对分钟，"
+                    "按原航段顺序，均为非负整数）；个数必须与原快照航段数一致，"
+                    "事务内与复算最优建议逐段比对"
+    )
+    idempotency_key: str = Field(
+        min_length=1, max_length=128,
+        description="非空改期幂等键：同键同内容重试返回首次结果；同键异内容冲突",
+    )
+
+
+class RescheduleVoidOut(BaseModel):
+    trip_id: int = Field(description="被作废的原行程号")
+    reason: str = Field(description="本次改期自动作废原行程时的不可变系统原因")
+    voided_at: str = Field(description="原行程作废时间（即改期确认时间）")
+
+
+class RescheduleConfirmOut(BaseModel):
+    idempotency_key: str
+    old_trip_id: int = Field(description="被作废的原确认行程号（历史快照仍可查）")
+    new_trip_id: int = Field(description="改期后新确认的行程号（待另行开单）")
+    snapshot_revision: int = Field(description="原确认快照所据修订号")
+    target_revision: int = Field(description="本次改期所据（新快照固化的）修订号")
+    replayed: bool = Field(
+        description="true=同键同内容重试，返回首次结果（HTTP 200）；首次执行为 false（HTTP 201）"
+    )
+    reschedule: RescheduleOut = Field(
+        description="事务内按当前航时管制、狭窄水道组、泊位日历与其他有效占用"
+                    "（排除原行程）复算并与提交逐段比对一致的改期行程（即新快照内容）"
+    )
+    old_void: RescheduleVoidOut = Field(description="原行程作废记录")
+    reversal_created: bool = Field(
+        description="true=原账单存在，已在同一事务内等额冲销一次；false=原行程未开单、无冲销"
+    )
+    reversal: Optional[ReversalOut] = Field(
+        default=None,
+        description="原账单的等额冲销单（reversal_created=true 时给出）；"
+                    "未开单时为 null，新行程待另行开单",
     )
 
 

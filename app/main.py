@@ -27,6 +27,8 @@ from .schemas import (
     NodeIn,
     PlanRequest,
     PlanResponse,
+    RescheduleConfirmOut,
+    RescheduleConfirmRequest,
     ReversalOut,
     ReviewRequest,
     RevisionOut,
@@ -62,6 +64,7 @@ from .services.controls import load_controls, replace_segment_controls
 from .services.groups import create_group, get_group, list_groups
 from .services.planning import find_itinerary, load_occupancy
 from .services.reschedule import review_and_reschedule
+from .services.reschedule_confirm import confirm_reschedule
 from .services.ships import (
     create_ship,
     get_ship,
@@ -986,6 +989,40 @@ def review_trip(trip_id: int, body: Optional[ReviewRequest] = None):
     with get_conn() as conn:
         result = review_and_reschedule(conn, trip_id, target_revision)
     return result
+
+
+@app.post(
+    "/api/trips/{trip_id}/reschedule",
+    response_model=RescheduleConfirmOut,
+    tags=["trips"],
+)
+def confirm_trip_reschedule(trip_id: int, body: RescheduleConfirmRequest):
+    """凭已确认行程号、目标潮位修订号、复核建议中的逐段出发分钟与非空幂等键，
+    执行**不安全航次的改期**（原行程作废 + 新行程确认，单事务幂等）。
+
+    仅当原行程仍有效、目标修订为最新、原快照在该修订下不安全且窗口内有解时，
+    按原航段顺序、船舶快照参数、起始分钟、窗口及泊位作业分钟，在同一事务内按
+    **当前航时管制、狭窄水道组、泊位日历与其他有效占用（排除原行程）**重算最优
+    建议；提交的逐段出发分钟须与复算最优建议逐段一致。通过后原行程作废
+    （旧占用失效）、新快照确认（新占用生效）；原账单若存在在该事务内**等额
+    冲销一次**，新行程待另行开单。
+
+    - 未知行程 `404 TRIP_NOT_FOUND`；原行程已作废 `409 TRIP_ALREADY_VOIDED`；
+    - 关联档案船已停用 `409 SHIP_DISABLED`、版本已变
+      `409 SHIP_VERSION_STALE`、档案已删 `404 SHIP_NOT_FOUND`；
+    - 目标修订未知 `404 TIDE_REVISION_NOT_FOUND`、已过期 `409 REVISION_STALE`；
+    - 原快照仍安全 `409 RESCHEDULE_NOT_NEEDED`；窗口内无改期解
+      `409 RESCHEDULE_NO_SOLUTION`；逐段出发分钟段数不符 `422 VALIDATION_ERROR`、
+      与复算不一致 `409 PLAN_MISMATCH`（details 回传复算结果）；任一失败均
+      **不改变状态**；
+    - 同键同内容重试返回**首次结果**（200，replayed=true，即使此后修订又变化
+      也先重放）；同键异内容 `409 RESCHEDULE_KEY_CONFLICT`。
+    """
+    with get_conn() as conn:
+        result, replayed = confirm_reschedule(conn, trip_id, body)
+    if replayed:
+        return JSONResponse(status_code=200, content=result)
+    return JSONResponse(status_code=201, content=result)
 
 
 def _trip_out(d: dict) -> TripOut:

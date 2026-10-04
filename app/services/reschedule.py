@@ -55,6 +55,82 @@ def review_and_reschedule(
     目标修订不存在 -> TIDE_REVISION_NOT_FOUND (404)
     窗口内缺潮位 -> MISSING_TIDE_DATA (422)
     """
+    ctx = _load_review_context(conn, trip_id, revision)
+
+    # 4) 原航路复核：只按目标修订检查潮位（与其他快照的占用重叠不判风险）
+    violation = _check_original(
+        ctx["legs"], ctx["segs"], ctx["tide"],
+        ctx["draft"], ctx["height"], ctx["margin"],
+    )
+    safe = violation is None
+
+    result = {
+        "trip_id": ctx["trip_id"],
+        "snapshot_revision": ctx["snapshot_revision"],
+        "target_revision": ctx["revision"],
+        "origin": ctx["origin"],
+        "destination": ctx["destination"],
+        "start_minute": ctx["start"],
+        "window_minutes": ctx["window"],
+        "draft": ctx["draft"],
+        "height": ctx["height"],
+        "margin": ctx["margin"],
+        "original_arrival_minute": ctx["arrival"],
+        "safe": safe,
+        "first_violation": violation,
+        "reschedule": None,
+        "no_solution": False,
+        "original_itinerary": ctx["legs"],
+        # 泊位快照（未指定泊位的旧确认为 None）；潮位复核本身仍只按原快照
+        "berth_id": ctx["berth_id"],
+        "work_minutes": ctx["work_minutes"],
+        "work_start_minute": ctx["work_start_minute"],
+        "work_end_minute": ctx["work_end_minute"],
+    }
+
+    # 5) 安全（含零航段）：原行程本身即最优改期（0 段变动），无需改期
+    if safe:
+        return result
+
+    # 6) 不安全：在相同航段序列/参数/窗口下求改期行程。
+    resched = solve_reschedule(conn, ctx)
+    if resched is None:
+        result["no_solution"] = True
+    else:
+        result["reschedule"] = resched
+    return result
+
+
+def solve_reschedule(conn, ctx: dict) -> Optional[dict]:
+    """按已加载的复核上下文求改期建议（无解返回 None）。
+
+    占用须避开其他已确认快照，但排除本快照自身（建议不占位）；改期按
+    **当前分时航时管制 / 狭窄水道组关系 / 泊位开放日历与其他有效占用**求解
+    （已确认快照的既有占用时长不随管制变化，但新行程各段航时以进入分钟当前
+    管制计）。原快照指定泊位时，建议须同时在原泊位找到可用即时作业区间。
+    """
+    blocked = load_occupancy(
+        conn, ctx["start"], ctx["start"] + ctx["window"] - 1,
+        exclude_trip_id=ctx["trip_id"],
+    )
+    controls = load_controls(conn, [leg["seg_id"] for leg in ctx["legs"]])
+    return _reschedule(
+        ctx["legs"], ctx["segs"], ctx["tide"],
+        ctx["start"], ctx["window"],
+        ctx["draft"], ctx["height"], ctx["margin"], ctx["revision"],
+        blocked, controls,
+        berth_id=ctx["berth_id"], work_minutes=ctx["work_minutes"],
+        berth_calendar=ctx["berth_calendar"],
+        berth_occupied=ctx["berth_occupied"],
+    )
+
+
+def _load_review_context(conn, trip_id: int, revision: Optional[int]) -> dict:
+    """加载复核 / 改期确认共用的快照、修订潮位、航段与泊位上下文。
+
+    未知行程 -> TRIP_NOT_FOUND (404)；目标修订不存在 ->
+    TIDE_REVISION_NOT_FOUND (404)；窗口内缺潮位 -> MISSING_TIDE_DATA (422)。
+    """
     # 1) 读取不可变快照（只读，不改写）
     row = conn.execute(
         "SELECT * FROM confirmed_trips WHERE trip_id = ?", (trip_id,)
@@ -110,56 +186,30 @@ def review_and_reschedule(
 
     segs = _load_segments(conn)
 
-    # 4) 原航路复核：只按目标修订检查潮位（与其他快照的占用重叠不判风险）
-    violation = _check_original(legs, segs, tide, draft, height, margin)
-    safe = violation is None
-
-    result = {
+    return {
         "trip_id": snap["trip_id"],
         "snapshot_revision": snap["revision"],
-        "target_revision": revision,
+        "revision": revision,
         "origin": snap["origin"],
         "destination": snap["destination"],
-        "start_minute": start,
-        "window_minutes": window,
+        "start": start,
+        "window": window,
+        "horizon": horizon,
         "draft": draft,
         "height": height,
         "margin": margin,
-        "original_arrival_minute": snap["arrival_minute"],
-        "safe": safe,
-        "first_violation": violation,
-        "reschedule": None,
-        "no_solution": False,
-        "original_itinerary": legs,
-        # 泊位快照（未指定泊位的旧确认为 None）；潮位复核本身仍只按原快照
+        "arrival": snap["arrival_minute"],
+        "legs": legs,
+        "tide": tide,
+        "segs": segs,
         "berth_id": berth_id,
         "work_minutes": work_minutes,
         "work_start_minute": snap["work_start_minute"],
         "work_end_minute": snap["work_end_minute"],
+        "berth_calendar": berth_calendar,
+        "berth_occupied": berth_occupied,
+        "snap": snap,
     }
-
-    # 5) 安全（含零航段）：原行程本身即最优改期（0 段变动），无需改期
-    if safe:
-        return result
-
-    # 6) 不安全：在相同航段序列/参数/窗口下求改期行程。
-    #    占用须避开其他已确认快照，但排除本快照自身（建议不占位）。
-    #    改期按**当前分时航时管制**求解（已确认快照的既有占用时长不随管制变化，
-    #    但新行程各段航时以进入分钟当前管制计）。
-    blocked = load_occupancy(conn, start, horizon - 1,
-                             exclude_trip_id=snap["trip_id"])
-    controls = load_controls(conn, [leg["seg_id"] for leg in legs])
-    resched = _reschedule(
-        legs, segs, tide, start, window, draft, height, margin, revision,
-        blocked, controls,
-        berth_id=berth_id, work_minutes=work_minutes,
-        berth_calendar=berth_calendar, berth_occupied=berth_occupied,
-    )
-    if resched is None:
-        result["no_solution"] = True
-    else:
-        result["reschedule"] = resched
-    return result
 
 
 def _violation_reasons(
