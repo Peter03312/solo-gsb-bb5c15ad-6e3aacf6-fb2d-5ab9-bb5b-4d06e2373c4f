@@ -691,3 +691,67 @@ class BerthOut(BaseModel):
     calendar: list[BerthIntervalOut] = Field(
         description="当前生效的开放日历（按起点升序）；空列表表示全程不开放"
     )
+
+
+# ---- 不安全航次执行改期（作废原行程 + 确认新快照 + 等额冲销，幂等） -----------------
+
+class RescheduleExecuteRequest(BaseModel):
+    target_revision: int = Field(
+        description="目标潮位修订号（必填）；执行时须仍为最新修订，否则 REVISION_STALE"
+    )
+    departures: list[int] = Field(
+        description="复核建议 reschedule.itinerary 中各段的逐段出发分钟"
+                    "（绝对分钟，按原航段顺序原样回填）；每段必须为非负整数，"
+                    "段数须与原快照航段数一致"
+    )
+    idempotency_key: str = Field(
+        min_length=1, max_length=128,
+        description="非空改期幂等键（≤128 字符）：同键同内容重试返回首次结果；"
+                    "同键异内容 RESCHEDULE_KEY_CONFLICT",
+    )
+
+    @model_validator(mode="after")
+    def _departures_non_negative(self):
+        bad = [d for d in self.departures if not isinstance(d, int)
+               or isinstance(d, bool) or d < 0]
+        if bad:
+            raise ValueError("逐段出发分钟必须全部为非负整数")
+        return self
+
+
+class RescheduleVoidOut(BaseModel):
+    trip_id: int = Field(description="被作废的原行程号")
+    reason: str = Field(description="原行程的作废原因（执行改期时同事务写入的系统原因）")
+    voided_at: str = Field(description="原行程作废时间")
+
+
+class RescheduleReversalOut(BaseModel):
+    trip_id: int = Field(description="被等额冲销的原账单行程号（即原行程号）")
+    version: int = Field(description="冲销沿用的费率版本（原账单固化版本，不可变）")
+    total_cents: int = Field(
+        description="冲销总额（非正整数分）：与原账单等额相反"
+    )
+    segments: list[BillSegmentOut] = Field(
+        description="逐段冲销结果：金额为原账单各段相反数"
+    )
+    reversed_at: str = Field(description="冲销生成时间（与原行程作废同事务）")
+
+
+class RescheduleExecuteResponse(BaseModel):
+    old_trip_id: int = Field(description="被作废的原（不安全）行程号")
+    new_trip_id: int = Field(
+        description="改期后确认的新行程号（新不可变快照；待另行开单）"
+    )
+    target_revision: int = Field(description="本次改期实际所据（执行时最新）修订号")
+    recalculated: RescheduleOut = Field(
+        description="事务内复算并确认的最优改期行程（与只读复核 reschedule 同形）"
+    )
+    old_void: RescheduleVoidOut = Field(description="原行程的作废记录")
+    reversal: Optional[RescheduleReversalOut] = Field(
+        default=None,
+        description="原账单存在时的等额冲销单（恰一次）；原行程未开单为 null；"
+                    "新行程不自动开单",
+    )
+    replayed: bool = Field(
+        description="true=同键同内容重试，返回首次结果（HTTP 200）；首次成功为 false（HTTP 201）"
+    )

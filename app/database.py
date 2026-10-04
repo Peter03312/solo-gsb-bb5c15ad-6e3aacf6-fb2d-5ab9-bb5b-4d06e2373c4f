@@ -193,6 +193,22 @@ CREATE TABLE IF NOT EXISTS toll_reversals (
     segments      TEXT NOT NULL,                                           -- 逐段冲销结果 JSON（金额取反）
     reversed_at   TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- 不安全航次执行改期的幂等记录（调度员凭已确认行程号 + 目标修订 + 复核建议
+-- 的逐段出发分钟 + 非空幂等键执行）。首次成功在同一事务内：作废原行程、
+-- 确认新快照（原账单等额冲销一次），并把首次结果（新旧行程号、复算行程、
+-- 冲销状态）固化在 result 中。同键同内容重试直接返回首次结果（即使修订
+-- 随后又变化也先重放）；同键异内容 RESCHEDULE_KEY_CONFLICT。
+-- 原快照（confirmed_trips）与批次幂等记录（batch_confirmations）均不改写。
+CREATE TABLE IF NOT EXISTS reschedule_records (
+    idempotency_key TEXT PRIMARY KEY,                       -- 改期幂等键（全局命名空间，非空、<=128 字符）
+    trip_id         INTEGER NOT NULL REFERENCES confirmed_trips(trip_id),  -- 被改期的原行程号
+    new_trip_id     INTEGER NOT NULL REFERENCES confirmed_trips(trip_id),  -- 改期后新行程号
+    target_revision INTEGER NOT NULL,                       -- 改期所据（执行时为最新）目标修订号
+    content_hash    TEXT NOT NULL,                          -- 提交内容（行程号 + 修订号 + 逐段出发分钟）的规范化哈希
+    result          TEXT NOT NULL,                          -- 首次成功结果 JSON（含复算行程与冲销状态）
+    rescheduled_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
 """
 
 

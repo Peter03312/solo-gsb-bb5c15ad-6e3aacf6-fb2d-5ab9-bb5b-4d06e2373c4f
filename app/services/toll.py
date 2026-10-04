@@ -262,6 +262,11 @@ def _load_bill_row(conn, trip_id: int):
     ).fetchone()
 
 
+def bill_exists(conn, trip_id: int) -> bool:
+    """该行程是否已开具通行费账单（供执行改期在同一事务内判定是否需要等额冲销）。"""
+    return _load_bill_row(conn, trip_id) is not None
+
+
 def _load_reversal(conn, trip_id: int):
     row = conn.execute(
         "SELECT bill_trip_id, version, total_cents, segments, reversed_at"

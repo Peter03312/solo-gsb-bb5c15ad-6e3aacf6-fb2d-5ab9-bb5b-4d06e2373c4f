@@ -27,6 +27,8 @@ from .schemas import (
     NodeIn,
     PlanRequest,
     PlanResponse,
+    RescheduleExecuteRequest,
+    RescheduleExecuteResponse,
     ReversalOut,
     ReviewRequest,
     RevisionOut,
@@ -62,6 +64,7 @@ from .services.controls import load_controls, replace_segment_controls
 from .services.groups import create_group, get_group, list_groups
 from .services.planning import find_itinerary, load_occupancy
 from .services.reschedule import review_and_reschedule
+from .services.reschedule_execute import execute_reschedule
 from .services.ships import (
     create_ship,
     get_ship,
@@ -986,6 +989,39 @@ def review_trip(trip_id: int, body: Optional[ReviewRequest] = None):
     with get_conn() as conn:
         result = review_and_reschedule(conn, trip_id, target_revision)
     return result
+
+
+@app.post(
+    "/api/trips/{trip_id}/reschedule",
+    response_model=RescheduleExecuteResponse,
+    tags=["trips"],
+)
+def execute_trip_reschedule(trip_id: int, body: RescheduleExecuteRequest):
+    """执行不安全航次的改期（单事务：作废原行程 + 确认新快照 + 等额冲销）。
+
+    凭**已确认行程号、目标潮位修订号、复核建议中的逐段出发分钟和非空
+    幂等键**执行。仅当原行程仍有效（未作废）、目标修订为最新、原快照在
+    该修订下不安全且窗口内有解、提交的逐段出发分钟与事务内按当前航时
+    管制/狭窄水道组/泊位日历与其他有效占用（排除原行程）复算的最优建议
+    一致时才提交；未知行程 `TRIP_NOT_FOUND`、原行程已作废
+    `TRIP_ALREADY_VOIDED`、关联档案停用 `SHIP_DISABLED` / 版本已变
+    `SHIP_VERSION_STALE`、目标修订未知 `TIDE_REVISION_NOT_FOUND` / 过期
+    `REVISION_STALE`、原行程仍安全 `TRIP_SAFE`、无解或方案不一致
+    `PLAN_MISMATCH` 均拒绝且不改变状态。
+
+    通过后同事务作废原行程（旧占用失效、新占用生效）并确认新快照；
+    原账单若存在等额冲销一次（新行程待另行开单）。首次成功 201；同键同
+    内容重试 200、`replayed=true` 返回首次结果（即使修订此后又变化也先
+    重放）；同键异内容 409 `RESCHEDULE_KEY_CONFLICT`。
+    """
+    with get_conn() as conn:
+        result, replayed = execute_reschedule(
+            conn, trip_id, body.target_revision,
+            list(body.departures), body.idempotency_key,
+        )
+    if replayed:
+        return JSONResponse(status_code=200, content=result)
+    return JSONResponse(status_code=201, content=result)
 
 
 def _trip_out(d: dict) -> TripOut:

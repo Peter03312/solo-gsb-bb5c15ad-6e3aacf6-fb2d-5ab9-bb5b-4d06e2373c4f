@@ -316,6 +316,52 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
      `no_solution=true`，此时仍可在 `/api/trips` 读到原封不动的快照。缺名义潮位、
      未知行程、未知修订沿用 `MISSING_TIDE_DATA` / `TRIP_NOT_FOUND` /
      `TIDE_REVISION_NOT_FOUND` 既有错误语义。
+- **不安全航次执行改期**（`POST /api/trips/{trip_id}/reschedule`）：只读
+  复核给出改期建议后，调度员凭**已确认行程号 + 目标修订号 + 复核建议
+  reschedule 中的逐段出发分钟（按原航段顺序的绝对分钟）+ 非空幂等键
+  （1～128 字符）**把不安全航次落库改期。
+  - **单事务核验顺序**（`BEGIN IMMEDIATE`，任一失败整体回滚、不改变
+    状态）：
+    0. **幂等重放优先于一切**：幂等键已存在时，内容（行程号 + 目标修订 +
+       逐段出发分钟的规范化哈希）一致直接返回首次结果（`replayed=true`，
+       **即使原行程已作废、此后修订又变化也先重放**）；不一致
+       `409 RESCHEDULE_KEY_CONFLICT`（`details.existing_trip_id`）；
+    1. 未知行程 `404 TRIP_NOT_FOUND`；原行程已作废
+       `409 TRIP_ALREADY_VOIDED`；
+    2. 快照关联船舶档案（`ship_no` 非空）时，档案须**仍启用且版本未变**：
+       停用 `409 SHIP_DISABLED`、版本已变 `409 SHIP_VERSION_STALE`；
+       直接提交参数确认的快照（无档案引用）跳过本步；
+    3. 目标修订未知 `404 TIDE_REVISION_NOT_FOUND`；非最新
+       `409 REVISION_STALE`（`provided_revision/current_revision`）；
+    4. 复用只读复核机器按**当前航时管制、狭窄水道组、泊位日历与其他有效
+       占用（排除原行程）**复算：缺潮位 `422 MISSING_TIDE_DATA`；原快照
+       仍安全（含零航段）`409 TRIP_SAFE`；不安全但窗口内无解（潮位可行但
+       被占满、或原泊位当前日历下无可用即时作业区间）
+       `409 PLAN_MISMATCH`（`reason=no_feasible_itinerary`）；
+    5. 提交的逐段出发分钟与复算最优建议**段数不同或任一段不同** ->
+       `409 PLAN_MISMATCH`（`reason=itinerary_mismatch`，`details` 附
+       `submitted_departures/recalculated_departures/recalculated`）。
+  - **提交后的同事务落库**：① 按复算行程写入**新不可变快照**
+    `confirmed_trips`（修订为目标修订；起终点、船舶参数、原起始分钟/窗口、
+    `ship_no/ship_version` 档案引用沿用原快照；各段航时与占用、泊位作业
+    区间按复算结果固化，泊位沿用原快照 `berth_id/work_minutes`）；
+    ② 作废原行程（插入 `voided_trips`，原因注明被哪个新行程替代）——
+    旧航段占用、狭窄水道组展开占用与泊位作业占用经读侧过滤即时失效，新
+    快照占用立即生效；历史快照仍可查；③ 原账单若存在，在**同一事务**
+    **等额冲销一次**（与手工作废同一张 `toll_reversals`：逐段金额与总额
+    取账单相反数、版本沿用账单版本；原行程未开单则无冲销，
+    `reversal=null`）；新行程**不自动开单**，须另行调用
+    `POST /api/trips/{new_trip_id}/bill`；④ 登记改期幂等记录后提交。
+  - **响应**：`{old_trip_id, new_trip_id, target_revision,
+    recalculated(与只读复核 reschedule 同形), old_void{trip_id,reason,
+    voided_at}, reversal(原账单存在时为等额冲销单，否则 null), replayed}`。
+    首次成功 `201`；同键同内容重试 `200`。改期幂等键使用**全局独立命名
+    空间**（与批次幂等键互不相干）。
+  - **不变量**：只读复核 `review`、手工作废 `void`、开单 `bill`、批次
+    预排/确认及其幂等记录的请求/响应/状态码完全不变；原确认快照不改写、
+    不删除（作废后作为历史快照保留）；并发由写锁与
+    `reschedule_records`/`voided_trips`/`toll_reversals` 的唯一约束串行
+    兜底，不遗漏、不重复冲销。
 - **误确认行程作废**：调度员误确认后，可凭**行程号与非空作废原因**作废已确认行程。
   - **作废接口**（`POST /api/trips/{trip_id}/void`，请求体
     `{"reason": "…"}`）：原因剥离首尾空白后不能为空（空串/纯空白 ->
@@ -493,6 +539,27 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
     `no_solution=true`（即使航段时间上可改期）。建议响应
     `reschedule` 内附 `berth_id/work_start_minute/work_end_minute`。
 
+**本轮新增不安全航次执行改期**：调度员凭**已确认行程号、目标潮位修订号、
+复核建议中的逐段出发分钟和非空幂等键**，把复核确认不安全的航次**执行
+改期**（`POST /api/trips/{id}/reschedule`）：单个 `BEGIN IMMEDIATE`
+事务内依次核验——原行程仍有效（未作废）、目标修订仍为最新、快照关联
+船舶档案仍启用且版本未变、原快照在该修订下确实不安全，再按**原航段
+顺序、船舶快照参数、原起始分钟与窗口**，以**当前航时管制、狭窄水道组、
+泊位日历与其他有效占用（排除原行程）**复算最优建议；窗口内无解
+（含原泊位无即时作业区间）、提交的逐段出发分钟与复算建议不一致
+（`PLAN_MISMATCH`，段数不同或任一段不同）、修订过期
+（`REVISION_STALE`）、原行程仍安全（`TRIP_SAFE`）、档案停用/版本已变
+（`SHIP_DISABLED`/`SHIP_VERSION_STALE`）、未知行程/修订均**拒绝且不
+改变状态**。全部通过后在**同一事务**内：写入新不可变快照（修订为目标
+修订，参数/档案引用/泊位沿用原快照口径，各段按当前管制固化）、作废原
+行程（旧航段/组/泊位占用即时失效、新占用生效）、**原账单若存在等额
+冲销一次**（复用既有冲销单语义；新行程**不自动开单**，待另行
+`POST /api/trips/{新行程号}/bill`）。响应返回新旧行程号、复算行程与
+冲销状态；首次成功 `201`，**同键同内容重试 `200 replayed=true` 返回
+首次结果（即使此后修订又变化也先重放）**，同键异内容
+`409 RESCHEDULE_KEY_CONFLICT`。原快照、批次幂等记录及现有接口契约
+（含只读复核、作废、开单接口）完全不变。
+
 ### 错误响应格式
 
 ```json
@@ -544,12 +611,39 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 泊位开放区间非法（`start<0` / `end<=start`），替换失败不改旧日历 | 422 | `INVALID_BERTH_INTERVAL` |
 | 泊位开放区间组内半开交叠，替换失败不改旧日历 | 422 | `OVERLAPPING_BERTH_INTERVAL` |
 | 作业分钟非正整数、泊位与作业分钟不成对 | 422 | `VALIDATION_ERROR` |
+| 执行改期时原行程在目标修订下仍安全（含零航段），无需改期 | 409 | `TRIP_SAFE` |
+| 执行改期时原行程已作废 | 409 | `TRIP_ALREADY_VOIDED` |
+| 执行改期窗口内无解，或提交逐段出发分钟与事务内复算建议不一致 | 409 | `PLAN_MISMATCH`（`reason=no_feasible_itinerary` / `itinerary_mismatch`） |
+| 同一改期幂等键提交了不同内容（不同行程号/修订号/逐段出发分钟） | 409 | `RESCHEDULE_KEY_CONFLICT` |
+| 改期幂等键缺失/为空/超长、逐段出发分钟为负 | 422 | `VALIDATION_ERROR` |
 
 ---
 
 ## 3. HTTP API
 
-> **本轮用法（终点泊位与开放日历）**：新增 4 个泊位端点，并为单船/批次
+> **本轮用法（不安全航次执行改期）**：新增 1 个端点
+> `POST /api/trips/{trip_id}/reschedule`，把只读复核给出的改期建议在单事务
+> 内落库；只读复核、作废、开单、批次等**既有端点的路径与契约完全不变**——
+> - 前置：先 `POST /api/trips/{id}/review` 取得目标修订下的改期建议
+>   （`safe=false` 且 `no_solution=false` 时 `reschedule` 非空）；
+> - 请求体：`{"target_revision": 2, "departures": [8, 11],
+>   "idempotency_key": "rs-2026-10-04-01"}`，其中 `departures` 为建议
+>   `reschedule.itinerary` 各段**逐段出发分钟**（按原航段顺序的绝对分钟，
+>   段数须与原快照一致；非负整数），`idempotency_key` 非空、≤128 字符；
+> - 事务内核验：原行程未作废、目标修订仍最新、关联档案仍启用且版本未变、
+>   原快照确实不安全、窗口内有解且提交分钟与按**当前管制/狭窄水道组/泊位
+>   日历/其他有效占用（排除原行程）**复算的最优建议一致；否则
+>   `TRIP_NOT_FOUND` / `TRIP_ALREADY_VOIDED` / `TIDE_REVISION_NOT_FOUND` /
+>   `REVISION_STALE` / `SHIP_DISABLED` / `SHIP_VERSION_STALE` /
+>   `TRIP_SAFE` / `PLAN_MISMATCH` 拒绝且**不改变状态**；
+> - 通过后同事务：确认新快照（修订=目标修订，参数/档案引用/泊位沿用原
+>   快照）、作废原行程（旧占用失效、新占用生效）、原账单**等额冲销一次**
+>   （无账单则 `reversal=null`；新行程待另行开单）；
+> - 首次 `201`，同键同内容重试 `200 replayed=true`（即使修订又变化也先
+>   重放），同键异内容 `409 RESCHEDULE_KEY_CONFLICT`；
+> - 原快照、批次幂等记录与现有接口契约保持不变。
+>
+> **上一轮用法（终点泊位与开放日历）**：新增 4 个泊位端点，并为单船/批次
 > 预排与确认扩展可选泊位字段；不带泊位字段的旧请求与响应**完全兼容**
 > （仅新增值为 `null` 的可空字段）——
 > - `POST /api/nodes/{node_id}/berths`：为现有节点登记泊位（全局唯一泊位
@@ -728,6 +822,7 @@ DB_PATH=./tide.db SEED_DEMO=true uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/api/trips/batch/plan` | **本轮扩展泊位**：同修订 2～5 艘船按优先顺序批次预排（只读不占位，后船避前船航段与泊位拟占用） |
 | POST | `/api/trips/batch/confirm` | 携带修订号 + 幂等键批次确认（事务逐艘复算，全成全败、幂等重放；泊位作业区间一并复算固化） |
 | POST | `/api/trips/{trip_id}/review` | 更正后按目标修订复核原行程，不安全时求改期；**本轮扩展**：快照指定泊位时改期建议须同时给出原泊位可用即时作业区间（只建议不预留），否则 `no_solution` |
+| POST | `/api/trips/{trip_id}/reschedule` | **本轮新增**：凭目标修订号 + 复核建议逐段出发分钟 + 非空幂等键执行不安全航次改期（单事务：确认新快照、作废原行程、原账单等额冲销一次）；同键同内容重放首次结果，异内容 `RESCHEDULE_KEY_CONFLICT` |
 | POST | `/api/trips/{trip_id}/void` | 凭非空原因作废误确认行程（重复作废 200 返回首次记录）；作废已开单行程时同事务生成等额冲销单（接口请求/响应/状态码不变） |
 | GET | `/api/trips/{trip_id}/void` | 按行程号查询作废记录（未作废 `VOID_RECORD_NOT_FOUND`） |
 | POST | `/api/trips/{trip_id}/bill` | **本轮新增**：为已确认行程开具通行费账单（按当时最新版本 + 快照进入分钟固化；重试 200 返回原账单；已作废未开单 `TRIP_ALREADY_VOIDED`） |
@@ -1416,6 +1511,88 @@ POST /api/trips/1/review
   原泊位窗口内无处作业时同样 `no_solution=true`。
 - 该接口为**只读**：不新增、不修改任何确认行程，也不产生新修订。
 
+### 不安全航次执行改期请求 / 响应示例（本轮新增）
+
+先经只读复核取得改期建议（见上节），再把建议中各段的**逐段出发分钟**
+（`reschedule.itinerary[*].start_minute`）连同目标修订号与非空幂等键
+提交执行：
+
+```json
+POST /api/trips/1/reschedule
+{
+  "target_revision": 2,
+  "departures": [101, 141],
+  "idempotency_key": "reschedule-trip1-rev2-2026-10-04"
+}
+```
+
+- `departures` 段数必须与原快照航段数一致（零航段行程恒安全、不能改期）；
+  任一段为负整数或缺幂等键 -> `422 VALIDATION_ERROR`。
+- 服务在**同一事务**内核验原行程仍有效、目标修订仍为最新、关联档案仍
+  启用且版本未变、原快照在目标修订下不安全，并按**当前航时管制、狭窄
+  水道组、泊位日历与其他有效占用（排除原行程）**复算；提交的出发分钟
+  与复算最优建议逐段一致才提交。
+
+首次成功返回 `201`（下例原行程已开单，故同事务生成等额冲销；未开单时
+`reversal` 为 `null`）：
+
+```json
+{
+  "old_trip_id": 1,
+  "new_trip_id": 9,
+  "target_revision": 2,
+  "recalculated": {
+    "revision": 2,
+    "arrival_minute": 161,
+    "total_wait_minutes": 71,
+    "changed_leg_count": 2,
+    "changed_legs": [
+      {"leg_index": 1, "seg_id": 2, "original_departure_minute": 84,  "new_departure_minute": 101},
+      {"leg_index": 2, "seg_id": 3, "original_departure_minute": 124, "new_departure_minute": 141}
+    ],
+    "itinerary": [
+      {"seg_id": 1, "origin": "A", "destination": "B", "start_minute": 54,  "end_minute": 84,  "travel_time": 30},
+      {"seg_id": 2, "origin": "B", "destination": "C", "start_minute": 101, "end_minute": 141, "travel_time": 40},
+      {"seg_id": 3, "origin": "C", "destination": "D", "start_minute": 141, "end_minute": 161, "travel_time": 20}
+    ],
+    "berth_id": null, "work_minutes": null,
+    "work_start_minute": null, "work_end_minute": null
+  },
+  "old_void": {
+    "trip_id": 1,
+    "reason": "执行不安全航次改期：原行程 #1 在目标潮位修订下不安全，已由改期新行程 #9 替代，原占用失效",
+    "voided_at": "2026-10-04 09:20:31"
+  },
+  "reversal": {
+    "trip_id": 1,
+    "version": 2,
+    "total_cents": -360,
+    "segments": [ /* 原账单各段金额取反，版本沿用账单版本 */ ],
+    "reversed_at": "2026-10-04 09:20:31"
+  },
+  "replayed": false
+}
+```
+
+- 旧行程 `#1` 立即表现为已作废（`GET /api/trips/1` 的 `voided_at` 非空，
+  快照原样可查），其航段/狭窄水道组/泊位占用即时失效；新行程 `#9` 为
+  有效确认快照（`revision=2`），新占用立即生效。
+- **原账单等额冲销一次**：账单与冲销单均可查
+  （`GET /api/trips/1/bill` 内嵌 `reversal`、
+  `GET /api/trips/1/reversal`）；重复执行同一幂等键不会重复冲销。
+  **新行程不自动开单**——需要时另行 `POST /api/trips/9/bill`。
+- **同键同内容重试**：`200`、`replayed=true`，返回**首次**的
+  `old_trip_id/new_trip_id/recalculated/reversal`，即使这期间又产生了新
+  潮位修订、原行程已作废，也**先重放**、不复算、不新增快照；
+  **同键异内容（换行程号/修订号/出发分钟）**：`409 RESCHEDULE_KEY_CONFLICT`。
+- **拒绝不改状态**：原行程已作废 `TRIP_ALREADY_VOIDED`、修订过期
+  `REVISION_STALE`、仍安全 `TRIP_SAFE`、档案停用 `SHIP_DISABLED` /
+  版本已变 `SHIP_VERSION_STALE`、窗口无解或方案不一致 `PLAN_MISMATCH`
+  时，不插入新快照、不作废、不冲销（`GET /api/trips` 行程数不变）。
+- **涉及泊位的快照**：新快照沿用原泊位与作业分钟；复算时作业区间按原
+  泊位**当前开放日历**与其他有效快照泊位占用求解（抵达即开工）。原泊位
+  窗口内无处作业时按 `PLAN_MISMATCH(no_feasible_itinerary)` 拒绝。
+
 ---
 
 ## 4. 调用示例（curl）
@@ -1644,6 +1821,29 @@ curl -s -X POST $BASE/api/trips/confirm -H 'Content-Type: application/json' \
 #    建议不占位、快照不改写
 curl -s -X POST $BASE/api/trips/$TID/review -H 'Content-Type: application/json' -d '{}'
 
+# 7b) 本轮新增：执行不安全航次改期（先 review 取得建议，再回填逐段出发分钟）
+#     单事务：确认新快照 + 作废原行程 + 原账单等额冲销（未开单 reversal=null）
+RS=$(curl -s -X POST $BASE/api/trips/$TID/review -H 'Content-Type: application/json' \
+  -d '{"target_revision":2}')
+python3 - <<PY
+import json, os, urllib.request
+rs = json.loads('''$RS''')
+assert rs["safe"] is False and rs["no_solution"] is False
+body = {"target_revision": rs["target_revision"],
+        "departures": [leg["start_minute"] for leg in rs["reschedule"]["itinerary"]],
+        "idempotency_key": "reschedule-trip$TID-rev2"}
+req = urllib.request.Request(
+    "http://localhost:8000/api/trips/$TID/reschedule",
+    data=json.dumps(body).encode(), headers={"Content-Type": "application/json"},
+    method="POST")
+print(json.dumps(json.load(urllib.request.urlopen(req)), ensure_ascii=False, indent=2))
+PY
+# 201 {"old_trip_id":1,"new_trip_id":9,"recalculated":{...},"reversal":{...}|null}
+# 同键同内容重试 -> 200、replayed=true（即使此后修订又变化也先重放）
+# 同键异内容 -> 409 RESCHEDULE_KEY_CONFLICT
+# 新行程不自动开单，需要时：curl -s -X POST $BASE/api/trips/9/bill
+# 原账单冲销单可查：curl -s $BASE/api/trips/$TID/reversal
+
 # 8) 本轮新增：同修订批次预排（2～5 艘，按优先顺序；后船自动避开前船拟占用，不占位）
 curl -s -X POST $BASE/api/trips/batch/plan -H 'Content-Type: application/json' -d '{
   "revision": 1,
@@ -1712,6 +1912,26 @@ else:
     print("改期：变动航段", rs["changed_leg_count"], "个，改至第",
           rs["arrival_minute"], "分钟抵达")
     print("新出发分钟：", [l["start_minute"] for l in rs["itinerary"]])
+
+# 执行改期（单事务：新快照 + 作废原行程 + 原账单等额冲销；幂等）
+exec_r = requests.post(f"{B}/api/trips/{tid}/reschedule", json={
+    "target_revision": rv["target_revision"],
+    "departures": [l["start_minute"] for l in rs["itinerary"]],
+    "idempotency_key": f"reschedule-{tid}-rev{rv['target_revision']}",
+})
+exec_r.raise_for_status()
+ex = exec_r.json()
+print("旧行程", ex["old_trip_id"], "-> 新行程", ex["new_trip_id"])
+print("冲销状态：", ex["reversal"] and ex["reversal"]["total_cents"])
+# 新行程待另行开单
+requests.post(f"{B}/api/trips/{ex['new_trip_id']}/bill")
+# 同键同内容重试：200 + 首次结果（即使修订又变化也先重放）
+retry = requests.post(f"{B}/api/trips/{tid}/reschedule", json={
+    "target_revision": rv["target_revision"],
+    "departures": [l["start_minute"] for l in rs["itinerary"]],
+    "idempotency_key": f"reschedule-{tid}-rev{rv['target_revision']}",
+})
+assert retry.status_code == 200 and retry.json()["replayed"] is True
 ```
 
 Python 示例（同修订批次预排 → 确认 → 幂等重试）：
@@ -2188,6 +2408,39 @@ curl -s -X POST $BASE/api/segments -H 'Content-Type: application/json' \
 出发分钟后，变动段数同增 0/1、出发序列同追加同一值，字典序关系不变，故每状态只保留
 一个最优代价不会丢失最优解。
 
+### 不安全航次执行改期（实现见 `app/services/reschedule_execute.py`）
+
+1. 建表 `reschedule_records(idempotency_key PRIMARY KEY, trip_id,
+   new_trip_id, target_revision, content_hash, result, rescheduled_at)`：
+   改期幂等键全局唯一（与批次幂等键不同表、不同命名空间），`result` 固化
+   首次成功响应；旧库启动随 `SCHEMA` 幂等建表，无需手工迁移。
+2. **单事务 `BEGIN IMMEDIATE`** 内严格按序执行：① 幂等键命中即重放/冲突
+   （**最先判定**，故即使修订又变化、原行程已作废，同键同内容仍返回首次
+   结果）；② 原行程存在且未作废；③ 快照有档案引用时经
+   `ships.resolve_for_confirm` 核对仍启用且版本未变；④ 目标修订存在且为
+   最新；⑤ 直接复用只读 `reschedule.review_and_reschedule` 在**同一事务
+   读视图**下复算（自然按当前管制/狭窄水道组/泊位日历与其他有效占用排除
+   原行程求解），安全 -> `TRIP_SAFE`、无解 ->
+   `PLAN_MISMATCH(no_feasible_itinerary)`；⑥ 提交的逐段出发分钟与复算
+   建议逐段不一致（段数或任一段）->
+   `PLAN_MISMATCH(itinerary_mismatch)`。
+3. **原子落库**：先插入新 `confirmed_trips` 快照（拿到 `new_trip_id` 后
+   作废原因可引用它），再插入 `voided_trips`（主键兜底并发重复作废），同
+   事务调用既有 `toll.create_reversal_in_void`——原账单存在则写一张等额
+   冲销（与手工作废完全同一张表、同口径，唯一约束保证恰一次），未开单为
+   空操作；最后插入幂等记录。任一步异常整体 `ROLLBACK`：新快照、作废与
+   冲销全部撤销，状态不变。
+4. **幂等竞争**：插入幂等记录撞唯一键时回滚本事务全部写入，再按已存在
+   记录重判同内容重放 / 异内容 `RESCHEDULE_KEY_CONFLICT`。因所有写路径
+   （确认、作废、开单、执行改期）均在 `BEGIN IMMEDIATE` 下经 SQLite 写锁
+   串行，且 `voided_trips.trip_id` 与 `toll_reversals.bill_trip_id` 唯一
+   约束兜底，任何并发顺序下都不会产生重复作废/重复冲销或相互重叠的有效
+   占用行程。
+5. **快照口径**：新快照固化目标修订号与复算航时/占用/泊位作业区间，船舶
+   参数与档案引用沿用原快照（之后档案再变不改写）；原快照不删不改，仅经
+   `voided_trips` 在读侧释放占用。只读复核、手工作废、开单与批次接口代码
+   路径完全不变。
+
 ---
 
 ## 6. 项目结构
@@ -2203,11 +2456,12 @@ app/
   services/planning.py  # 潮汐约束与时间展开 DP 规划算法（航时按进入分钟管制选定；load_occupancy 展开组占用）
   services/batch.py     # 同修订批次预排/确认（逐艘串行规划 + 事务复算 + 幂等键；批内拟占用同步展开组占用）
   services/reschedule.py# 更正后原行程复核与改期 DP（复核只判潮位；改期避开他人组占用且排除自身、按当前管制，只读）
+  services/reschedule_execute.py# 不安全航次执行改期：单事务复算比对 + 确认新快照 + 作废原行程 + 等额冲销（幂等重放/冲突）
   services/voids.py     # 误确认作废：事务内作废（重复作废返回首次记录）、作废记录查询；已开单则同事务生成等额冲销
   services/toll.py      # 通行费：费率版本（整组替换+继承，不可变）、开单（按当时最新版本与快照进入分钟固化）、冲销/查询
   services/ships.py     # 船舶档案：建档/版本化变更（单事务）、当前与历史版本查询、规划/确认用档案解析
-  main.py               # FastAPI 路由（节点/航段/分时管制/狭窄水道组/船舶档案/潮位更正与误差修订/单船与批次规划确认/复核改期/作废）
-tests/                  # pytest 测试（165 个，含择优、缺潮位、事务冲突、误差带、复核改期、航段占用、批次预排/确认/幂等、分时航时管制、狭窄水道组、作废与并发串行、船舶档案与船号规划确认等）
+  main.py               # FastAPI 路由（节点/航段/分时管制/狭窄水道组/船舶档案/潮位更正与误差修订/单船与批次规划确认/复核改期/执行改期/作废）
+tests/                  # pytest 测试（233 个，含择优、缺潮位、事务冲突、误差带、复核改期、执行改期与幂等冲销、航段占用、批次预排/确认/幂等、分时航时管制、狭窄水道组、作废与并发串行、船舶档案与船号规划确认等）
 Dockerfile
 docker-compose.yml
 requirements.txt
